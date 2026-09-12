@@ -1,13 +1,22 @@
-// Bump VERSION when shipping changed shell files. Updates activate on the next
-// full close/reopen, so a new release never reloads a listener's active player.
-const VERSION = 'v5';
+// A fresh page load gets the latest shell online; an open player stays unchanged.
+// No polling, forced activation, or automatic reloads. HTML edits need no version bump.
+// VERSION changes only when the worker/cache format itself changes.
+const VERSION = 'v8';
 const PREFIX = `fc-archive-${new URL(self.registration.scope).pathname}-`;
 const SHELL = `${PREFIX}shell-${VERSION}`;
 const METADATA = `${PREFIX}metadata-v1`;
-const ASSETS = ['index.html','album.html','manifest.webmanifest'];
+const ASSETS = ['index.html', 'album.html', 'manifest.webmanifest'];
 const scoped = path => new URL(path, self.registration.scope).href;
+
 self.addEventListener('install', event => {
-  event.waitUntil(caches.open(SHELL).then(cache => cache.addAll(ASSETS.map(scoped))));
+  event.waitUntil((async () => {
+    const cache = await caches.open(SHELL);
+    await Promise.all(ASSETS.map(async path => {
+      const response = await fetch(scoped(path), {cache:'no-store'});
+      if (!response.ok) throw new Error(`Could not cache ${path}`);
+      await cache.put(scoped(path), response);
+    }));
+  })());
 });
 self.addEventListener('activate', event => {
   event.waitUntil((async () => {
@@ -17,19 +26,32 @@ self.addEventListener('activate', event => {
     await self.clients.claim();
   })());
 });
+async function freshShell(request, path) {
+  const cache = await caches.open(SHELL);
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 6000);
+  try {
+    const response = await fetch(request, {cache:'no-store', signal:controller.signal});
+    if (!response.ok) throw new Error('Shell unavailable');
+    // Query strings select app views, not separate versions of the static shell.
+    await cache.put(scoped(path), response.clone());
+    return response;
+  } catch (error) {
+    const cached = await cache.match(scoped(path));
+    if (cached) return cached;
+    throw error;
+  } finally { clearTimeout(timeout); }
+}
 self.addEventListener('fetch', event => {
   const request = event.request;
   if (request.method !== 'GET') return;
   const url = new URL(request.url);
-  // Never cache streamed audio or intercept range requests.
+  // Audio, including the in-memory seek fallback, is never cached here.
   if (request.headers.has('range') || url.pathname.startsWith('/download/')) return;
   if (url.origin === self.location.origin && url.href.startsWith(self.registration.scope)) {
     const relative = url.pathname.slice(new URL(self.registration.scope).pathname.length);
-    if (request.mode === 'navigate' && ['', 'index.html', 'album.html'].includes(relative)) {
-      event.respondWith(caches.open(SHELL).then(cache => cache.match(scoped(relative || 'index.html'))).then(cached => cached || fetch(request)));
-    } else if (ASSETS.includes(relative)) {
-      event.respondWith(caches.open(SHELL).then(cache => cache.match(scoped(relative))).then(cached => cached || fetch(request)));
-    }
+    if (relative === '' && request.mode === 'navigate') event.respondWith(freshShell(request, 'index.html'));
+    else if (ASSETS.includes(relative)) event.respondWith(freshShell(request, relative));
   } else if (url.origin === 'https://archive.org' && url.pathname.startsWith('/metadata/')) {
     event.respondWith((async () => {
       const cache = await caches.open(METADATA);
